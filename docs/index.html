@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Clasificador de Eficiencia Energetica de Edificios</title>
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="icon"
+    href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='80' font-size='80'%3E%F0%9F%8F%A2%3C/text%3E%3C/svg%3E" />
+  <!-- onnxruntime-web -->
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.1/dist/ort.min.js"></script>
+  <!-- PapaParse para CSV, SheetJS para XLSX -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+</head>
+<body>
+  <header class="hero">
+    <div class="hero-inner">
+      <div class="hero-icon" aria-hidden="true">
+        <svg viewBox="0 0 64 64" width="64" height="64" fill="none">
+          <rect x="8" y="20" width="20" height="36" rx="2" fill="#34d399" opacity="0.9"/>
+          <rect x="32" y="8" width="24" height="48" rx="2" fill="#10b981"/>
+          <rect x="12" y="26" width="4" height="4" fill="#fff"/>
+          <rect x="20" y="26" width="4" height="4" fill="#fff"/>
+          <rect x="12" y="36" width="4" height="4" fill="#fff"/>
+          <rect x="20" y="36" width="4" height="4" fill="#fff"/>
+          <rect x="12" y="46" width="4" height="4" fill="#fff"/>
+          <rect x="20" y="46" width="4" height="4" fill="#fff"/>
+          <rect x="36" y="14" width="4" height="4" fill="#fff"/>
+          <rect x="44" y="14" width="4" height="4" fill="#fff"/>
+          <rect x="36" y="24" width="4" height="4" fill="#fff"/>
+          <rect x="44" y="24" width="4" height="4" fill="#fff"/>
+          <rect x="36" y="34" width="4" height="4" fill="#fff"/>
+          <rect x="44" y="34" width="4" height="4" fill="#fff"/>
+          <rect x="36" y="44" width="4" height="4" fill="#fff"/>
+          <rect x="44" y="44" width="4" height="4" fill="#fff"/>
+          <path d="M52 4 L48 14 L54 14 L50 24" stroke="#fbbf24" stroke-width="2" fill="none" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <div>
+        <h1>Clasificador de Eficiencia Energetica</h1>
+        <p class="subtitle">
+          Predice si un edificio sera <strong>eficiente</strong> en calefaccion
+          a partir de 8 parametros arquitectonicos. Entrenado con el dataset
+          <em>Energy Efficiency</em> (UCI). Inferencia 100% en tu navegador.
+        </p>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- Selector de modelo -->
+    <section class="card model-selector">
+      <h2>Modelo</h2>
+      <div class="radio-group">
+        <label class="radio-card">
+          <input type="radio" name="modelo" value="logreg" checked />
+          <div>
+            <span class="modelo-nombre">Regresion Logistica</span>
+            <span class="modelo-acc" data-modelo="logreg">--</span>
+          </div>
+        </label>
+        <label class="radio-card">
+          <input type="radio" name="modelo" value="mlp" />
+          <div>
+            <span class="modelo-nombre">Red Neuronal (MLP)</span>
+            <span class="modelo-acc" data-modelo="mlp">--</span>
+          </div>
+        </label>
+      </div>
+      <p id="estado-modelo" class="status">Cargando modelos...</p>
+      <p id="info-umbral" class="muted small"></p>
+    </section>
+
+    <!-- Tabs -->
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-tab="individual" role="tab">Prediccion individual</button>
+      <button class="tab" data-tab="lote" role="tab">Prediccion por lotes</button>
+      <button class="tab" data-tab="info" role="tab">Sobre el proyecto</button>
+    </nav>
+
+    <!-- ============== INDIVIDUAL ============== -->
+    <section id="tab-individual" class="tab-panel active">
+      <div class="card">
+        <h2>Caracteristicas del edificio</h2>
+        <p class="muted">
+          Ingresa los 8 parametros arquitectonicos. Si dudas, pulsa
+          <em>Cargar valores promedio</em> para usar la media del dataset.
+        </p>
+
+        <form id="form-individual">
+          <div id="form-grid" class="form-grid"></div>
+          <div class="actions">
+            <button type="button" id="btn-promedio" class="btn btn-secondary">Cargar valores promedio</button>
+            <button type="button" id="btn-limpiar" class="btn btn-secondary">Limpiar</button>
+            <button type="submit" class="btn btn-primary">Predecir Eficiencia</button>
+          </div>
+        </form>
+
+        <div id="resultado-individual" class="resultado oculto">
+          <div id="diagnostico-card" class="diagnostico-card">
+            <span id="ind-icono" class="icono-grande"></span>
+            <div>
+              <span class="label">Resultado</span>
+              <span id="ind-prediccion" class="diagnostico"></span>
+            </div>
+          </div>
+
+          <div class="resultado-grid">
+            <div>
+              <span class="label">Probabilidad de ser eficiente</span>
+              <span id="ind-prob-ef" class="prob"></span>
+            </div>
+            <div>
+              <span class="label">Probabilidad de no eficiente</span>
+              <span id="ind-prob-no" class="prob"></span>
+            </div>
+          </div>
+
+          <div class="prob-bar-container" title="Probabilidad de Eficiente">
+            <div id="prob-bar" class="prob-bar"></div>
+          </div>
+
+          <div id="ood-warning" class="ood-warning oculto"></div>
+
+          <p id="interpretacion" class="interpretacion"></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============== LOTE ============== -->
+    <section id="tab-lote" class="tab-panel">
+      <div class="card">
+        <h2>Prediccion por lotes</h2>
+        <p class="muted">
+          Sube un archivo <strong>CSV</strong> o <strong>XLSX</strong> con las 8 columnas X1...X8.
+          Si incluyes <code>Y1</code> (Heating Load) o <code>eficiente</code> (0/1),
+          calculamos matriz de confusion y metricas en vivo.
+        </p>
+        <p class="muted">
+          ¿No tienes archivo? Descarga el de ejemplo:
+          <a href="ejemplo_lote.csv" download>ejemplo_lote.csv</a>
+        </p>
+
+        <div class="file-input-wrapper">
+          <input type="file" id="file-input" accept=".csv,.xlsx,.xls" />
+          <button type="button" id="btn-procesar" class="btn btn-primary" disabled>Procesar</button>
+          <button type="button" id="btn-descargar" class="btn btn-secondary oculto">Descargar resultados (CSV)</button>
+        </div>
+
+        <p id="estado-csv" class="status"></p>
+
+        <div id="resultado-lote" class="resultado oculto">
+          <div id="metricas-lote" class="metricas-grid"></div>
+          <div id="cm-lote-wrapper" class="oculto">
+            <h3>Matriz de confusion</h3>
+            <div id="cm-lote" class="cm"></div>
+            <p class="muted small">
+              TN = no eficientes detectados; TP = eficientes detectados;
+              FP = falsos eficientes (riesgo de certificacion erronea);
+              FN = eficientes no detectados.
+            </p>
+          </div>
+          <h3>Predicciones por fila</h3>
+          <div class="tabla-wrapper">
+            <table id="tabla-predicciones">
+              <thead></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============== INFO ============== -->
+    <section id="tab-info" class="tab-panel">
+      <div class="card">
+        <h2>Sobre el proyecto</h2>
+        <p>
+          Modelos entrenados con el dataset <strong>Energy Efficiency</strong>
+          (UCI), 768 edificios simulados con 8 caracteristicas arquitectonicas
+          y 2 cargas energeticas (calefaccion y refrigeracion).
+        </p>
+        <p>
+          El problema original es de regresion. Aqui se transforma en
+          <strong>clasificacion binaria</strong> usando la mediana de la
+          carga de calefaccion (<em>Heating Load</em>, Y1) como umbral:
+        </p>
+        <ul>
+          <li><strong>Eficiente (1):</strong> Y1 &lt; mediana del dataset</li>
+          <li><strong>No eficiente (0):</strong> Y1 &ge; mediana del dataset</li>
+        </ul>
+        <p>
+          Asi obtenemos clases perfectamente balanceadas (50/50), lo que hace
+          que la <em>accuracy</em> sea una metrica honesta sin tener que
+          ajustar pesos de clase.
+        </p>
+
+        <h3>Arquitectura tecnica</h3>
+        <ul>
+          <li>Entrenamiento en Python con scikit-learn.</li>
+          <li>Exportacion a <strong>ONNX</strong> con <code>skl2onnx</code>.</li>
+          <li>Inferencia en navegador con <code>onnxruntime-web</code>.</li>
+          <li>El <code>StandardScaler</code> se replica en JS leyendo su
+            <em>mean</em> y <em>scale</em> guardados.</li>
+          <li>Sin backend: 100% estatico (GitHub Pages).</li>
+        </ul>
+
+        <h3>Como leer la matriz de confusion en este contexto</h3>
+        <p>
+          En certificaciones de eficiencia energetica el error mas costoso suele
+          ser el <strong>Falso Positivo</strong> (clasificar como eficiente un
+          edificio que no lo es): podria emitirse una etiqueta verde a una
+          construccion que no la merece. Por eso, ademas de la accuracy,
+          conviene mirar la <em>precision</em> sobre la clase Eficiente.
+        </p>
+
+        <h3>Limitaciones</h3>
+        <ul>
+          <li>Dataset <strong>simulado</strong>, no edificios reales.</li>
+          <li>Solo 768 muestras y 8 features arquitectonicas.</li>
+          <li>No considera clima, materiales, uso ni ocupacion.</li>
+          <li>El umbral es la mediana del propio dataset, no un estandar
+            normativo (ej. EnergyStar, Passivhaus).</li>
+        </ul>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>
+      Proyecto educativo. Inferencia totalmente local en tu navegador (los datos no salen del dispositivo).
+    </p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+pandas
+openpyxl
+scikit-learn
+matplotlib
+skl2onnx
+onnx
+numpy

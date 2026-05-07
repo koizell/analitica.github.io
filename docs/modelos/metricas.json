@@ -1,0 +1,46 @@
+{
+  "logreg": {
+    "nombre": "Regresion Logistica",
+    "accuracy": 0.974025974025974,
+    "precision": 0.9739130434782609,
+    "recall": 0.9739130434782609,
+    "f1": 0.9739130434782609,
+    "confusion_matrix": [
+      [
+        113,
+        3
+      ],
+      [
+        3,
+        112
+      ]
+    ]
+  },
+  "mlp": {
+    "nombre": "Red Neuronal (MLP)",
+    "accuracy": 0.974025974025974,
+    "precision": 0.9739130434782609,
+    "recall": 0.9739130434782609,
+    "f1": 0.9739130434782609,
+    "confusion_matrix": [
+      [
+        113,
+        3
+      ],
+      [
+        3,
+        112
+      ]
+    ]
+  },
+  "mlp_best_params": {
+    "activation": "tanh",
+    "alpha": 0.0001,
+    "hidden_layer_sizes": [
+      16
+    ],
+    "learning_rate_init": 0.001
+  },
+  "n_train": 537,
+  "n_test": 231
+}
