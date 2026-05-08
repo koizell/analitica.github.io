@@ -1,27 +1,86 @@
-/* Clasificador de Eficiencia Energetica - Inferencia en navegador.
+/* =============================================================================
+ * CLASIFICADOR DE EFICIENCIA ENERGETICA - INFERENCIA EN NAVEGADOR
  *
- * Carga modelos ONNX (LogReg y MLP), aplica StandardScaler en JS replicando
- * el de sklearn, y predice en el cliente. CSV via PapaParse, XLSX via SheetJS.
- * Sin backend: 100% estatico para GitHub Pages.
+ * Este archivo orquesta toda la inferencia que ocurre en el cliente:
+ *   1. Carga de los modelos ONNX (LogReg y MLP) y JSONs (scaler, features,
+ *      metricas, umbral).
+ *   2. Construccion dinamica del formulario de prediccion individual a
+ *      partir de features.json (los 8 campos se generan en el orden que
+ *      espera el modelo).
+ *   3. Escalado StandardScaler en JS, replicando el de sklearn.
+ *   4. Inferencia con onnxruntime-web (ONNX Runtime sobre WebAssembly).
+ *   5. Lectura de archivos CSV (PapaParse) y XLSX (SheetJS) para lotes.
+ *   6. Calculo en vivo de matriz de confusion y metricas si el lote trae
+ *      target (Y1 cruda o columna "eficiente").
+ *   7. Render de resultados (badges, prob bar, heatmap, tabla, descarga CSV).
+ *   8. Detector de inputs out-of-distribution (OOD) con warning visual
+ *      cuando el usuario ingresa valores que el modelo nunca vio.
+ *
+ * DEPENDENCIAS (CDN, cargadas en index.html):
+ *   - ort.min.js          -> onnxruntime-web (motor de inferencia ONNX).
+ *   - papaparse.min.js    -> parser de CSV en streaming.
+ *   - xlsx.full.min.js    -> SheetJS, lector de XLSX/XLS.
+ *
+ * SIN BACKEND. Todos los datos (formulario, archivo subido, resultados)
+ * permanecen en la memoria del navegador. La app funciona offline una vez
+ * cargados los modelos.
+ * =============================================================================
  */
 
-// onnxruntime-web busca sus .wasm junto al script principal por defecto, lo
-// que falla en GitHub Pages. Apuntamos al CDN para que coincidan versiones.
+
+/* -----------------------------------------------------------------------------
+ * CONFIGURACION DE onnxruntime-web
+ * ---------------------------------------------------------------------------*/
+// onnxruntime-web descarga sus binarios .wasm a peticion. Por defecto los
+// busca junto al script principal (lo que falla en GitHub Pages porque
+// nuestro script vive en docs/ pero el WASM no). Forzamos que los busque
+// en el mismo CDN desde donde cargamos ort.min.js, asi siempre coinciden
+// las versiones del JS y del WASM.
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.1/dist/";
 
+
+/* -----------------------------------------------------------------------------
+ * REGISTRO DE MODELOS
+ *
+ * Un objeto por modelo con su URL relativa y el slot donde guardaremos la
+ * sesion ONNX una vez creada. Las sesiones son objetos pesados (cargan el
+ * grafo en memoria), asi que las creamos una sola vez al inicio y las
+ * reutilizamos para todas las predicciones.
+ * ---------------------------------------------------------------------------*/
 const MODELOS = {
   logreg: { url: "modelos/logreg.onnx", session: null, nombre: "Regresion Logistica" },
   mlp:    { url: "modelos/mlp.onnx",    session: null, nombre: "Red Neuronal" },
 };
 
-let scaler = null, featuresInfo = null, metricasGlobal = null, umbralInfo = null;
-let datosLote = null, columnasLote = null, resultadoLoteCache = null;
+
+/* -----------------------------------------------------------------------------
+ * ESTADO GLOBAL
+ * ---------------------------------------------------------------------------*/
+// Datos cargados desde los JSON al arrancar (ver cargarRecursos).
+let scaler = null;         // { mean: [...], scale: [...], feature_names: [...] }
+let featuresInfo = null;   // { feature_names, feature_labels, feature_help, ... }
+let metricasGlobal = null; // { logreg: {...}, mlp: {...}, mlp_best_params: {...} }
+let umbralInfo = null;     // { umbral_y1_mediana, descripcion }
+
+// Estado del flujo de prediccion por lotes.
+let datosLote = null;          // Array de objetos: filas crudas del archivo subido.
+let columnasLote = null;       // Array de strings: nombres de columnas detectadas.
+let resultadoLoteCache = null; // Ultimo resultado de batch (para boton "Descargar").
 
 
-// 1. Carga inicial (JSONs en paralelo + sesiones ONNX en paralelo)
+/* =============================================================================
+ * 1. CARGA INICIAL DE RECURSOS
+ *
+ * Hace 4 fetches en paralelo a los JSON (rapido, son archivos pequenios),
+ * construye el formulario, pinta la accuracy en el selector, y luego
+ * inicializa las dos sesiones ONNX en paralelo. Si algo falla, deja un
+ * mensaje rojo en pantalla y no avanza (los botones quedan deshabilitados).
+ * =============================================================================*/
 async function cargarRecursos() {
   const estado = document.getElementById("estado-modelo");
   try {
+    // Promise.all dispara las 4 peticiones simultaneamente y resuelve cuando
+    // todas terminan -> mucho mas rapido que esperar una tras otra.
     const [scalerRes, featRes, metRes, umbRes] = await Promise.all([
       fetch("modelos/scaler.json"),
       fetch("modelos/features.json"),
@@ -36,12 +95,21 @@ async function cargarRecursos() {
     metricasGlobal = await metRes.json();
     umbralInfo = await umbRes.json();
 
+    // El formulario depende de featuresInfo, asi que se construye despues
+    // de tener los JSON pero antes de cargar los modelos: el usuario ve la
+    // UI completa lo antes posible mientras los .onnx se descargan.
     construirFormulario();
     pintarAccuracyEnSelector();
     pintarUmbral();
 
+    // Carga las sesiones ONNX en paralelo. InferenceSession.create descarga
+    // el .onnx, lo parsea y prepara los kernels de WebAssembly.
+    // executionProviders=["wasm"] usa el backend de WebAssembly puro,
+    // compatible con todos los navegadores modernos.
     await Promise.all(Object.values(MODELOS).map(async m => {
-      m.session = await ort.InferenceSession.create(m.url, { executionProviders: ["wasm"] });
+      m.session = await ort.InferenceSession.create(m.url, {
+        executionProviders: ["wasm"],
+      });
     }));
 
     estado.textContent = "Modelos cargados. Listos para predecir.";
@@ -54,6 +122,11 @@ async function cargarRecursos() {
   }
 }
 
+/**
+ * Pinta la accuracy de cada modelo (leida de metricas.json) junto a su nombre
+ * en las radio cards del selector. Util para que el usuario sepa cual modelo
+ * elegir antes de probar.
+ */
 function pintarAccuracyEnSelector() {
   document.querySelectorAll(".modelo-acc").forEach(el => {
     const m = metricasGlobal[el.dataset.modelo];
@@ -61,17 +134,36 @@ function pintarAccuracyEnSelector() {
   });
 }
 
+/**
+ * Muestra el umbral usado para binarizar Y1, para que el usuario pueda
+ * interpretar las predicciones en terminos de la mediana real del dataset.
+ */
 function pintarUmbral() {
   document.getElementById("info-umbral").textContent =
     `Umbral aplicado: Y1 < ${umbralInfo.umbral_y1_mediana.toFixed(2)} kWh/m² → Eficiente.`;
 }
 
 
-// 2. Formulario dinamico (8 inputs en el orden de feature_names)
+/* =============================================================================
+ * 2. CONSTRUCCION DINAMICA DEL FORMULARIO INDIVIDUAL
+ *
+ * En lugar de hardcodear 8 campos en el HTML, los generamos a partir de
+ * featuresInfo.feature_names. Esto garantiza que el orden de los inputs
+ * SIEMPRE coincida con el orden esperado por el modelo (no hay riesgo de
+ * mezclar X3 con X4 al editar el HTML).
+ *
+ * Cada campo es un <input type="number"> con:
+ *   - id "f-Xi" para localizarlo desde JS.
+ *   - min/max calculados del dataset real para validacion HTML5 nativa.
+ *   - texto de ayuda (feature_help) con la descripcion humana.
+ * =============================================================================*/
 function construirFormulario() {
   const grid = document.getElementById("form-grid");
   grid.innerHTML = "";
   featuresInfo.feature_names.forEach((name, idx) => {
+    // name -> nombre tecnico (X1..X8), usado como id del input y para
+    //         mapear despues al orden que espera el modelo.
+    // label -> nombre amigable en español, mostrado al usuario.
     const label = featuresInfo.feature_labels[idx] || name;
     const help = featuresInfo.feature_help?.[idx] || "";
     const min = featuresInfo.feature_min?.[idx];
@@ -89,11 +181,27 @@ function construirFormulario() {
 }
 
 
-/**
- * Detecta inputs fuera del dominio observado en entrenamiento. Para features
- * continuas avisa si el valor cae fuera de [min, max]; para cuasi-categoricas
- * avisa si no coincide con ningun valor del dataset (con tolerancia float).
- */
+/* =============================================================================
+ * 3. DETECTOR DE INPUTS OUT-OF-DISTRIBUTION
+ *
+ * Detecta valores que el modelo nunca vio durante el entrenamiento.
+ * Hay dos tipos de feature en el dataset:
+ *
+ *   a) Continuas (X1, X2): el dataset tiene muchos valores unicos.
+ *      WARNING si el valor cae fuera de [min, max] del dataset.
+ *
+ *   b) Cuasi-categoricas (X3..X8): el dataset solo tiene unos pocos valores
+ *      discretos (ej. X5 solo {3.5, 7}). features.json guarda esos valores
+ *      en feature_options.
+ *      WARNING si el valor ingresado no coincide exactamente con ninguno
+ *      de los valores validos (con tolerancia de 1e-6 para diferencias
+ *      de punto flotante: ej. 0.1 vs 0.10000001).
+ *
+ * Aunque entrenamos con noise augmentation (que reduce mucho la divergencia
+ * entre LogReg y MLP en zonas intermedias), avisar al usuario sigue siendo
+ * importante: la prediccion en valores no vistos es matematicamente
+ * extrapolacion, no informacion observada.
+ * =============================================================================*/
 function detectarOOD() {
   const warnings = [];
   featuresInfo.feature_names.forEach((name, idx) => {
@@ -106,15 +214,22 @@ function detectarOOD() {
     const label = featuresInfo.feature_labels[idx];
 
     if (Array.isArray(opciones) && opciones.length > 0) {
+      // Feature cuasi-categorica: el valor debe coincidir con alguno de la
+      // lista. Tolerancia pequenia para diferencias de punto flotante.
       const TOL = 1e-6;
       if (!opciones.some(o => Math.abs(o - v) < TOL)) {
-        warnings.push(`${label}: ${v} no es un valor presente en el dataset (validos: ${opciones.join(", ")})`);
+        warnings.push(
+          `${label}: ${v} no es un valor presente en el dataset (validos: ${opciones.join(", ")})`
+        );
       }
     } else {
+      // Feature continua: debe estar en [min, max].
       const min = featuresInfo.feature_min[idx];
       const max = featuresInfo.feature_max[idx];
       if (v < min || v > max) {
-        warnings.push(`${label}: ${v} fuera de [${min.toFixed(2)}, ${max.toFixed(2)}]`);
+        warnings.push(
+          `${label}: ${v} fuera de [${min.toFixed(2)}, ${max.toFixed(2)}]`
+        );
       }
     }
   });
@@ -122,7 +237,19 @@ function detectarOOD() {
 }
 
 
-// 3. Escalado replicando sklearn StandardScaler.transform: z = (x - mean) / scale
+/* =============================================================================
+ * 4. ESCALADO EN JS (replica de sklearn.preprocessing.StandardScaler)
+ *
+ * sklearn StandardScaler.transform aplica: z = (x - mean) / scale
+ * donde mean y scale son los aprendidos sobre X_train durante fit.
+ *
+ * Para que la inferencia en el navegador de exactamente los mismos resultados
+ * que en Python, debemos aplicar EXACTAMENTE la misma transformacion. Por
+ * eso guardamos mean y scale en scaler.json y los usamos aqui.
+ *
+ * Float32Array es el tipo que ONNX Runtime espera para tensores float32.
+ * Crearlo aqui directamente evita una conversion extra al construir el tensor.
+ * =============================================================================*/
 function escalar(fila) {
   const out = new Float32Array(fila.length);
   for (let i = 0; i < fila.length; i++) {
@@ -132,37 +259,79 @@ function escalar(fila) {
 }
 
 
-/**
- * Inferencia ONNX para un batch [N x F]. Tensor en row-major float32.
- * Devuelve { predicciones: int[N], probas: [pBenigno, pMaligno][N] }.
- * Localizamos labels/probabilities por regex porque skl2onnx puede generar
- * distintos nombres de salida segun la version.
- */
+/* =============================================================================
+ * 5. INFERENCIA ONNX PARA UN BATCH (N filas x F features)
+ *
+ * Layout del tensor de entrada:
+ *   - Shape [N, F] donde N=filas, F=8 features.
+ *   - Almacenamiento row-major (fila por fila, contigua en memoria).
+ *   - Tipo float32.
+ *
+ * El modelo devuelve dos tensores:
+ *   - "label" (int64 [N]): la clase predicha (0 o 1).
+ *   - "probabilities" (float32 [N, 2]): probabilidad de cada clase.
+ *     Como exportamos con zipmap=False en Python, es un tensor plano
+ *     (no un array de diccionarios), facil de leer linealmente.
+ *
+ * Buscamos las salidas por nombre via regex porque skl2onnx puede generarlas
+ * como "label"/"probabilities", "output_label"/"output_probability", u
+ * otros nombres segun la version. Una busqueda por regex hace el codigo
+ * robusto a esas variaciones.
+ * =============================================================================*/
 async function predecirBatch(filas) {
+  // Determina cual modelo usar leyendo el radio button activo. El selector
+  // es unico y compartido por las dos pestañas (individual y lote), asi que
+  // la seleccion persiste entre vistas.
   const modeloKey = document.querySelector('input[name="modelo"]:checked').value;
   const session = MODELOS[modeloKey].session;
   if (!session) throw new Error("Modelo no cargado.");
 
   const N = filas.length;
   const F = scaler.mean.length;
+
+  // Aplanamos el batch en un solo Float32Array de tamano N*F en orden
+  // row-major. ONNX espera el tensor "plano" con la shape declarada por
+  // separado en el constructor de Tensor.
   const data = new Float32Array(N * F);
-  for (let i = 0; i < N; i++) data.set(escalar(filas[i]), i * F);
+  for (let i = 0; i < N; i++) {
+    // .set copia los F valores escalados de la fila i en la posicion i*F.
+    data.set(escalar(filas[i]), i * F);
+  }
 
   const tensor = new ort.Tensor("float32", data, [N, F]);
+  // run() recibe un objeto { nombreEntrada: tensor } y devuelve un objeto
+  // con todas las salidas del grafo. La entrada se llama "input" porque
+  // asi la declaramos en exportar_onnx() en Python.
   const results = await session.run({ input: tensor });
+
   const outNames = Object.keys(results);
   const labelOut = results[outNames.find(n => /label/i.test(n))] || results[outNames[0]];
   const probOut  = results[outNames.find(n => /prob/i.test(n))]  || results[outNames[1]];
 
-  // labelOut.data puede ser BigInt64Array; Number() normaliza a numero JS.
+  // labelOut.data puede ser BigInt64Array (en algunos opsets) o Int64Array.
+  // Number(v) convierte ambos a numero JS estandar para no contaminar el
+  // resto del codigo con tipos especiales.
   const predicciones = Array.from(labelOut.data, v => Number(v));
+
+  // probOut.data viene plano: [p0_clase0, p0_clase1, p1_clase0, p1_clase1, ...].
+  // Lo desplegamos en filas de 2 elementos para facilitar el consumo.
   const probas = [];
-  for (let i = 0; i < N; i++) probas.push([probOut.data[i * 2], probOut.data[i * 2 + 1]]);
+  for (let i = 0; i < N; i++) {
+    probas.push([probOut.data[i * 2], probOut.data[i * 2 + 1]]);
+  }
   return { predicciones, probas, modelo: MODELOS[modeloKey].nombre };
 }
 
 
-// 4. Lectura y validacion del formulario individual
+/* =============================================================================
+ * 6. LECTURA Y VALIDACION DEL FORMULARIO INDIVIDUAL
+ * =============================================================================*/
+
+/**
+ * Recorre los 8 inputs en el orden definido por feature_names, valida que
+ * todos sean numeros, y devuelve el array de valores. Si algun campo es
+ * invalido lo marca visualmente (clase .invalido) y devuelve null.
+ */
 function leerFormulario() {
   const valores = [];
   let ok = true;
@@ -180,15 +349,20 @@ function leerFormulario() {
   return ok ? valores : null;
 }
 
+// Submit del formulario individual: lee, valida, predice y muestra resultado
+// con warning OOD si aplica.
 document.getElementById("form-individual").addEventListener("submit", async (e) => {
-  e.preventDefault();
+  e.preventDefault();  // Evita el recarga de pagina default del form.
   const valores = leerFormulario();
   if (!valores) {
     alert("Completa todos los campos como numeros validos.");
     return;
   }
   try {
+    // predecirBatch acepta N filas; aqui pasamos un batch de 1.
     const { predicciones, probas } = await predecirBatch([valores]);
+    // detectarOOD devuelve [] si todo esta dentro del rango -> el banner
+    // se oculta automaticamente en mostrarResultadoIndividual.
     mostrarResultadoIndividual(predicciones[0], probas[0], detectarOOD());
   } catch (err) {
     console.error(err);
@@ -196,6 +370,14 @@ document.getElementById("form-individual").addEventListener("submit", async (e) 
   }
 });
 
+/**
+ * Pinta el resultado de la prediccion individual:
+ *   - Tarjeta verde (eficiente) o roja (no eficiente) con icono y texto.
+ *   - Probabilidades de ambas clases en porcentaje.
+ *   - Barra de probabilidad horizontal (proporcional a P(eficiente)).
+ *   - Texto interpretativo contextual.
+ *   - Banner ambar de extrapolacion si hay warnings OOD.
+ */
 function mostrarResultadoIndividual(pred, proba, warnings = []) {
   const cont = document.getElementById("resultado-individual");
   cont.classList.remove("oculto");
@@ -221,11 +403,13 @@ function mostrarResultadoIndividual(pred, proba, warnings = []) {
       "Considera revisar la compacidad, el area acristalada y la altura: factores que tipicamente impactan el consumo energetico.";
   }
 
+  // proba[0] = P(no eficiente), proba[1] = P(eficiente).
   document.getElementById("ind-prob-ef").textContent = (proba[1] * 100).toFixed(2) + "%";
   document.getElementById("ind-prob-no").textContent = (proba[0] * 100).toFixed(2) + "%";
   document.getElementById("prob-bar").style.width = (proba[1] * 100).toFixed(2) + "%";
 
-  // Banner de extrapolacion: en zonas OOD, LogReg y MLP pueden divergir.
+  // Banner de extrapolacion: la augmentation reduce mucho la divergencia
+  // entre modelos pero no la elimina. El warning sigue siendo informativo.
   const oodBox = document.getElementById("ood-warning");
   if (warnings.length > 0) {
     oodBox.classList.remove("oculto");
@@ -238,11 +422,18 @@ function mostrarResultadoIndividual(pred, proba, warnings = []) {
     oodBox.classList.add("oculto");
   }
 
+  // Scroll suave para que el resultado quede visible si el form era largo.
   cont.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 
-// 5. Botones auxiliares del formulario
+/* =============================================================================
+ * 7. BOTONES AUXILIARES DEL FORMULARIO INDIVIDUAL
+ * =============================================================================*/
+
+// "Cargar valores promedio": rellena cada campo con la media calculada del
+// dataset (guardada en features.json). Util para que el usuario tenga un
+// punto de partida razonable en lugar de inputs vacios.
 document.getElementById("btn-promedio").addEventListener("click", () => {
   featuresInfo.feature_names.forEach((name, idx) => {
     const input = document.getElementById(`f-${name}`);
@@ -251,6 +442,7 @@ document.getElementById("btn-promedio").addEventListener("click", () => {
   });
 });
 
+// "Limpiar": resetea el formulario y oculta el resultado anterior.
 document.getElementById("btn-limpiar").addEventListener("click", () => {
   document.getElementById("form-individual").reset();
   document.querySelectorAll("#form-grid input").forEach(i => i.classList.remove("invalido"));
@@ -258,10 +450,25 @@ document.getElementById("btn-limpiar").addEventListener("click", () => {
 });
 
 
-// 6. Carga de archivo (CSV via PapaParse, XLSX via SheetJS)
+/* =============================================================================
+ * 8. CARGA DE ARCHIVO PARA PREDICCION POR LOTES (CSV o XLSX)
+ *
+ * Detecta la extension y usa el parser apropiado:
+ *   - .csv -> PapaParse (streaming, dynamicTyping convierte "12.5" a 12.5
+ *             automaticamente).
+ *   - .xlsx/.xls -> SheetJS (XLSX). Lee como ArrayBuffer y convierte la
+ *                   primera hoja del libro a JSON.
+ *
+ * En ambos casos terminamos con:
+ *   - datosLote: array de objetos {col1: val, col2: val, ...}.
+ *   - columnasLote: array con los nombres de columnas en orden.
+ * =============================================================================*/
 document.getElementById("file-input").addEventListener("change", (e) => {
   const file = e.target.files[0];
   if (!file) return;
+
+  // Reset visual: el usuario subio un archivo nuevo, ocultamos resultados
+  // del archivo anterior y limpiamos los estados ok/error.
   const estado = document.getElementById("estado-csv");
   estado.classList.remove("ok", "error");
   document.getElementById("resultado-lote").classList.add("oculto");
@@ -270,27 +477,40 @@ document.getElementById("file-input").addEventListener("change", (e) => {
   const ext = file.name.split(".").pop().toLowerCase();
   if (ext === "csv") {
     Papa.parse(file, {
-      header: true, skipEmptyLines: true, dynamicTyping: true,
+      header: true,            // Primera fila = nombres de columna.
+      skipEmptyLines: true,    // Ignora lineas vacias (comunes al final).
+      dynamicTyping: true,     // "1.5" -> 1.5, "true" -> true automaticamente.
       complete: (results) => {
         datosLote = results.data;
         columnasLote = results.meta.fields;
         estado.textContent = `CSV cargado: ${datosLote.length} filas, ${columnasLote.length} columnas.`;
         estado.classList.add("ok");
       },
-      error: (err) => { estado.textContent = "Error leyendo CSV: " + err.message; estado.classList.add("error"); },
+      error: (err) => {
+        estado.textContent = "Error leyendo CSV: " + err.message;
+        estado.classList.add("error");
+      },
     });
   } else if (ext === "xlsx" || ext === "xls") {
+    // SheetJS no soporta File directamente; hay que leer como ArrayBuffer.
     const reader = new FileReader();
     reader.onload = (ev) => {
       try {
+        // type:"array" indica que el input es un ArrayBuffer.
         const wb = XLSX.read(ev.target.result, { type: "array" });
+        // Tomamos solo la primera hoja del libro (suficiente para este caso).
         const ws = wb.Sheets[wb.SheetNames[0]];
+        // defval:null asegura que celdas vacias sean null en vez de
+        // undefined (mas predecible al filtrar despues).
         const json = XLSX.utils.sheet_to_json(ws, { defval: null });
         datosLote = json;
         columnasLote = Object.keys(json[0] || {});
         estado.textContent = `XLSX cargado: ${datosLote.length} filas, ${columnasLote.length} columnas.`;
         estado.classList.add("ok");
-      } catch (err) { estado.textContent = "Error leyendo XLSX: " + err.message; estado.classList.add("error"); }
+      } catch (err) {
+        estado.textContent = "Error leyendo XLSX: " + err.message;
+        estado.classList.add("error");
+      }
     };
     reader.readAsArrayBuffer(file);
   } else {
@@ -300,44 +520,77 @@ document.getElementById("file-input").addEventListener("change", (e) => {
 });
 
 
-// 7. Procesar lote (validacion + inferencia + render)
+/* =============================================================================
+ * 9. PROCESAMIENTO DEL LOTE
+ *
+ * Flujo:
+ *   a) Validar que el archivo tenga las 8 columnas X1..X8.
+ *   b) Detectar si trae target (Y1 cruda o columna "eficiente").
+ *   c) Convertir cada fila al orden esperado por el modelo (las columnas
+ *      pueden venir en cualquier orden dentro del CSV; las mapeamos por
+ *      nombre, no por posicion).
+ *   d) Filtrar filas con valores invalidos (NaN).
+ *   e) Llamar predecirBatch.
+ *   f) Mostrar resultados (metricas + matriz si hay target, solo
+ *      predicciones si no).
+ * =============================================================================*/
 document.getElementById("btn-procesar").addEventListener("click", async () => {
   const estado = document.getElementById("estado-csv");
   estado.classList.remove("ok", "error");
-  if (!datosLote) { estado.textContent = "Primero sube un archivo."; estado.classList.add("error"); return; }
-
-  const requeridas = featuresInfo.feature_names;
-  const faltantes = requeridas.filter(c => !columnasLote.includes(c));
-  if (faltantes.length > 0) {
-    estado.textContent = "Faltan columnas: " + faltantes.join(", ") + ". El archivo debe tener X1, X2, ..., X8.";
+  if (!datosLote) {
+    estado.textContent = "Primero sube un archivo.";
     estado.classList.add("error");
     return;
   }
 
-  // Target detectable de dos formas:
-  //   - columna "eficiente" (0/1) ya binarizada,
-  //   - columna "Y1" cruda (re-aplicamos el umbral guardado).
+  // Validacion: el archivo debe tener todas las features X1..X8. Si falta
+  // alguna no hay forma de hacer una prediccion correcta -> mostramos
+  // error claro indicando que columnas faltan.
+  const requeridas = featuresInfo.feature_names;
+  const faltantes = requeridas.filter(c => !columnasLote.includes(c));
+  if (faltantes.length > 0) {
+    estado.textContent = "Faltan columnas: " + faltantes.join(", ") +
+      ". El archivo debe tener X1, X2, ..., X8.";
+    estado.classList.add("error");
+    return;
+  }
+
+  // Detectamos el target. Hay dos formas validas de incluirlo:
+  //   - "eficiente" (0/1): target ya binarizado.
+  //   - "Y1": carga de calefaccion cruda; aplicamos el mismo umbral
+  //     guardado en umbral.json (mediana del dataset) para binarizarla.
   const tieneY1 = columnasLote.includes("Y1");
   const tieneEf = columnasLote.includes("eficiente");
 
+  // Construimos:
+  //   filas: [N x 8] valores numericos en el orden X1..X8.
+  //   yReal: [N] target binario (solo si tieneEf || tieneY1).
+  // Filtramos filas con NaN para evitar contaminar el escalado.
   const filas = [], yReal = [];
   for (const row of datosLote) {
     const f = requeridas.map(c => Number(row[c]));
-    if (f.some(v => isNaN(v))) continue;
+    if (f.some(v => isNaN(v))) continue;  // Skip silencioso.
     filas.push(f);
     if (tieneEf) yReal.push(Number(row.eficiente) === 1 ? 1 : 0);
     else if (tieneY1) yReal.push(Number(row.Y1) < umbralInfo.umbral_y1_mediana ? 1 : 0);
   }
-  if (filas.length === 0) { estado.textContent = "No hay filas validas."; estado.classList.add("error"); return; }
+  if (filas.length === 0) {
+    estado.textContent = "No hay filas validas.";
+    estado.classList.add("error");
+    return;
+  }
 
   try {
     estado.textContent = `Procesando ${filas.length} filas...`;
     const { predicciones, probas, modelo } = await predecirBatch(filas);
+    // tieneTarget = true si pudimos construir yReal del mismo tamaño que
+    // filas. Solo entonces mostramos metricas y matriz de confusion.
     const tieneTarget = yReal.length === filas.length;
     mostrarResultadoLote(filas, predicciones, probas, yReal, tieneTarget, modelo);
     estado.textContent = `Listo. ${filas.length} predicciones con ${modelo}.`;
     estado.classList.add("ok");
 
+    // Cache para que "Descargar" no tenga que rehacer la inferencia.
     resultadoLoteCache = { filas, predicciones, probas, yReal, tieneTarget };
     document.getElementById("btn-descargar").classList.remove("oculto");
   } catch (err) {
@@ -348,25 +601,41 @@ document.getElementById("btn-procesar").addEventListener("click", async () => {
 });
 
 
-// 8. Render del resultado de lote
+/* =============================================================================
+ * 10. RENDER DEL RESULTADO DE LOTE
+ *
+ * Construye:
+ *   - Tabla con todas las predicciones (badges visuales por clase).
+ *   - Tarjetas de metricas (accuracy, precision, recall, F1) si hay target;
+ *     resumen simple (filas, eficientes, no eficientes) si no.
+ *   - Matriz de confusion como heatmap si hay target.
+ * =============================================================================*/
 function mostrarResultadoLote(filas, predicciones, probas, yReal, tieneTarget, modeloNombre) {
   document.getElementById("resultado-lote").classList.remove("oculto");
 
   const thead = document.querySelector("#tabla-predicciones thead");
   const tbody = document.querySelector("#tabla-predicciones tbody");
 
+  // Cabecera dinamica: si no hay target, no mostramos columnas Real/Acierto.
   const headers = ["#", ...featuresInfo.feature_names, "Prediccion", "Prob. Eficiente"];
   if (tieneTarget) headers.push("Real", "Acierto");
   thead.innerHTML = "<tr>" + headers.map(h => `<th>${h}</th>`).join("") + "</tr>";
 
+  // Construimos las filas como HTML. Para datasets pequenios (~20-100 filas)
+  // este approach simple es adecuado; con miles de filas convendria virtualizar.
   tbody.innerHTML = predicciones.map((p, i) => {
     const cells = [`<td>${i + 1}</td>`];
+    // Cada feature con 2 decimales para no abrumar al usuario.
     filas[i].forEach(v => cells.push(`<td>${typeof v === "number" ? v.toFixed(2) : v}</td>`));
+
+    // Badge coloreado segun la prediccion (verde eficiente, rojo no eficiente).
     const badge = p === 1
       ? '<span class="badge badge-ef">Eficiente</span>'
       : '<span class="badge badge-no">No eficiente</span>';
     cells.push(`<td>${badge}</td>`);
     cells.push(`<td>${(probas[i][1] * 100).toFixed(1)}%</td>`);
+
+    // Si hay target, agregamos columnas Real y Acierto, y resaltamos la fila.
     let clase = "";
     if (tieneTarget) {
       const real = yReal[i];
@@ -375,6 +644,7 @@ function mostrarResultadoLote(filas, predicciones, probas, yReal, tieneTarget, m
         : '<span class="badge badge-no">No eficiente</span>';
       cells.push(`<td>${realBadge}</td>`);
       cells.push(`<td>${p === real ? "Si" : "No"}</td>`);
+      // Tinte verde para aciertos, rojo para errores.
       clase = p === real ? "acierto" : "error";
     }
     return `<tr class="${clase}">${cells.join("")}</tr>`;
@@ -384,6 +654,7 @@ function mostrarResultadoLote(filas, predicciones, probas, yReal, tieneTarget, m
   const cmWrapper = document.getElementById("cm-lote-wrapper");
 
   if (tieneTarget) {
+    // Caso 1: hay target -> calcular y mostrar metricas + matriz de confusion.
     const m = calcularMetricas(yReal, predicciones);
     metricasDiv.innerHTML = `
       <div class="metric"><span class="valor" style="font-size:1rem">${modeloNombre}</span><span class="nombre">Modelo</span></div>
@@ -395,6 +666,7 @@ function mostrarResultadoLote(filas, predicciones, probas, yReal, tieneTarget, m
     cmWrapper.classList.remove("oculto");
     renderMatrizConfusion(m.cm);
   } else {
+    // Caso 2: solo features -> resumen descriptivo, sin metricas.
     const ef = predicciones.filter(p => p === 1).length;
     metricasDiv.innerHTML = `
       <div class="metric"><span class="valor" style="font-size:1rem">${modeloNombre}</span><span class="nombre">Modelo</span></div>
@@ -409,8 +681,19 @@ function mostrarResultadoLote(filas, predicciones, probas, yReal, tieneTarget, m
 }
 
 
-// 9. Metricas y matriz de confusion (clase positiva = 1 = Eficiente)
-//    cm = [[TN, FP], [FN, TP]] (mismo formato que sklearn).
+/* =============================================================================
+ * 11. CALCULO DE METRICAS Y MATRIZ DE CONFUSION
+ *
+ * Convencion: clase positiva = 1 = "Eficiente".
+ *   TP = real Eficiente y predicho Eficiente.
+ *   TN = real No eficiente y predicho No eficiente.
+ *   FP = real No eficiente pero predicho Eficiente (falso positivo, costoso
+ *        en el contexto de certificaciones de eficiencia energetica).
+ *   FN = real Eficiente pero predicho No eficiente.
+ *
+ * Devolvemos cm en el formato sklearn: [[TN, FP], [FN, TP]] (filas=real,
+ * columnas=predicho).
+ * =============================================================================*/
 function calcularMetricas(yTrue, yPred) {
   let tn = 0, fp = 0, fn = 0, tp = 0;
   for (let i = 0; i < yTrue.length; i++) {
@@ -420,12 +703,23 @@ function calcularMetricas(yTrue, yPred) {
     else if (yTrue[i] === 1 && yPred[i] === 0) fn++;
   }
   const accuracy = (tp + tn) / yTrue.length;
+  // Salvaguardas contra division por cero (cuando el modelo no predice
+  // una clase en absoluto sobre el batch, lo que puede pasar con batches
+  // pequenios y modelos muy confiados).
   const precision = tp + fp === 0 ? 0 : tp / (tp + fp);
   const recall = tp + fn === 0 ? 0 : tp / (tp + fn);
-  const f1 = (precision + recall) === 0 ? 0 : 2 * precision * recall / (precision + recall);
+  const f1 = (precision + recall) === 0 ? 0
+             : 2 * precision * recall / (precision + recall);
   return { accuracy, precision, recall, f1, cm: [[tn, fp], [fn, tp]] };
 }
 
+/**
+ * Renderiza la matriz de confusion como un heatmap CSS Grid (no imagen):
+ *   - 3x3 celdas (cabeceras + 2x2 valores).
+ *   - Cada celda de valor se colorea segun su semantica
+ *     (verde para aciertos TN/TP, rojo para FP, ambar para FN).
+ *   - Numero grande con el conteo y etiqueta TN/FP/FN/TP.
+ */
 function renderMatrizConfusion(cm) {
   const [[tn, fp], [fn, tp]] = cm;
   document.getElementById("cm-lote").innerHTML = `
@@ -444,20 +738,32 @@ function renderMatrizConfusion(cm) {
 }
 
 
-// 10. Descarga de resultados como CSV (Blob -> URL temporal -> click)
+/* =============================================================================
+ * 12. DESCARGA DE RESULTADOS COMO CSV
+ *
+ * Construye un CSV en memoria con: features originales + prediccion +
+ * probabilidad + (si hay target) real y acierto. Lo entrega como Blob via
+ * URL.createObjectURL, simulando un click en un <a download>.
+ *
+ * URL.revokeObjectURL libera la URL temporal (buena practica para no
+ * mantener referencias innecesarias en memoria si el usuario descarga
+ * muchas veces).
+ * =============================================================================*/
 document.getElementById("btn-descargar").addEventListener("click", () => {
   if (!resultadoLoteCache) return;
   const { filas, predicciones, probas, yReal, tieneTarget } = resultadoLoteCache;
 
+  // Cabecera del CSV (siempre incluye features + prediccion + probabilidad).
   const cols = [...featuresInfo.feature_names, "prediccion", "prob_eficiente"];
   if (tieneTarget) cols.push("real", "acierto");
   const lineas = [cols.join(",")];
 
+  // Cuerpo: una linea por prediccion.
   for (let i = 0; i < predicciones.length; i++) {
     const fila = [
       ...filas[i],
       predicciones[i] === 1 ? "Eficiente" : "No eficiente",
-      probas[i][1].toFixed(4),
+      probas[i][1].toFixed(4),  // P(eficiente) con 4 decimales.
     ];
     if (tieneTarget) {
       fila.push(yReal[i] === 1 ? "Eficiente" : "No eficiente");
@@ -466,6 +772,7 @@ document.getElementById("btn-descargar").addEventListener("click", () => {
     lineas.push(fila.join(","));
   }
 
+  // Blob -> URL temporal -> trigger de descarga.
   const blob = new Blob([lineas.join("\n")], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -476,7 +783,13 @@ document.getElementById("btn-descargar").addEventListener("click", () => {
 });
 
 
-// 11. Tabs
+/* =============================================================================
+ * 13. NAVEGACION POR TABS
+ *
+ * Cada boton .tab tiene data-tab=<id>. Al hacer click:
+ *   - Quita .active de todos los botones y paneles.
+ *   - Pone .active al boton clickeado y al panel #tab-<id>.
+ * =============================================================================*/
 document.querySelectorAll(".tab").forEach(btn => {
   btn.addEventListener("click", () => {
     const target = btn.dataset.tab;
@@ -488,4 +801,12 @@ document.querySelectorAll(".tab").forEach(btn => {
 });
 
 
+/* =============================================================================
+ * ARRANQUE
+ *
+ * Disparamos la carga al final del archivo, una vez que todas las funciones
+ * y handlers estan definidos. cargarRecursos es asincrona pero no la
+ * await-eamos: dejamos que corra en background; los listeners ya estan
+ * activos y mostraran un mensaje de error si algo falla.
+ * =============================================================================*/
 cargarRecursos();
