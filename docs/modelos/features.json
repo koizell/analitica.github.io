@@ -20,11 +20,11 @@
     "Distribucion del Acristalamiento (0-5)"
   ],
   "feature_help": [
-    "Indice geometrico del edificio. Rangos tipicos del dataset: 0.62 a 0.98.",
+    "Indice geometrico del edificio. Rangos tipicos: 0.62 a 0.98.",
     "Superficie total exterior. Rangos: 514 a 808 m².",
     "Area total de muros. Rangos: 245 a 416 m².",
     "Area de techo. Rangos: 110 a 220 m².",
-    "Altura del edificio. Solo dos niveles en el dataset: 3.5 m o 7 m.",
+    "Altura del edificio. Solo dos niveles: 3.5 m o 7 m.",
     "Orientacion cardinal codificada del 2 al 5.",
     "Fraccion del area acristalada. Valores: 0, 0.1, 0.25 o 0.4.",
     "Patron de distribucion del acristalamiento, codificado del 0 al 5."

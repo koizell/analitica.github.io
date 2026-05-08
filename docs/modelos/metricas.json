@@ -18,29 +18,34 @@
   },
   "mlp": {
     "nombre": "Red Neuronal (MLP)",
-    "accuracy": 0.974025974025974,
-    "precision": 0.9739130434782609,
-    "recall": 0.9739130434782609,
-    "f1": 0.9739130434782609,
+    "accuracy": 0.987012987012987,
+    "precision": 0.9827586206896551,
+    "recall": 0.991304347826087,
+    "f1": 0.987012987012987,
     "confusion_matrix": [
       [
-        113,
-        3
+        114,
+        2
       ],
       [
-        3,
-        112
+        1,
+        114
       ]
     ]
   },
   "mlp_best_params": {
-    "activation": "tanh",
+    "activation": "relu",
     "alpha": 0.0001,
     "hidden_layer_sizes": [
+      32,
       16
     ],
-    "learning_rate_init": 0.001
+    "learning_rate_init": 0.01
   },
   "n_train": 537,
-  "n_test": 231
+  "n_test": 231,
+  "augmentation": {
+    "K": 5,
+    "noise_std": 0.15
+  }
 }

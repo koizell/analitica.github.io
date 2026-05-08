@@ -1,4 +1,4 @@
 {
   "umbral_y1_mediana": 18.95,
-  "descripcion": "Si Heating Load (Y1) < mediana del dataset, el edificio se considera Eficiente (clase 1). Si Y1 >= mediana, No eficiente (clase 0)."
+  "descripcion": "Si Y1 < mediana del dataset -> Eficiente (1), si no -> No eficiente (0)."
 }
