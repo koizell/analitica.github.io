@@ -160,61 +160,64 @@ function construirFormulario() {
     // Min y max calculados del dataset real -> validacion HTML5 nativa.
     const min = featuresInfo.feature_min?.[idx];
     const max = featuresInfo.feature_max?.[idx];
-    // Si la feature es categorica (pocos valores unicos en el dataset)
-    // tendra una lista de opciones validas. En ese caso renderizamos un
-    // <select> para que el usuario no pueda inventar combinaciones que
-    // el modelo nunca vio durante entrenamiento.
-    const options = featuresInfo.feature_options?.[idx];
 
     const div = document.createElement("div");
     div.className = "form-field";
-
-    if (Array.isArray(options) && options.length > 0) {
-      // Feature categorica -> dropdown con valores reales del dataset.
-      const opts = options.map(v =>
-        `<option value="${v}">${v}</option>`
-      ).join("");
-      div.innerHTML = `
-        <label for="f-${name}">${label}</label>
-        <select id="f-${name}" name="${name}" required data-categorical="1">
-          <option value="" disabled selected>-- elige un valor --</option>
-          ${opts}
-        </select>
-        <span class="help">${help}</span>
-      `;
-    } else {
-      // Feature continua -> input numerico con min/max del dataset.
-      div.innerHTML = `
-        <label for="f-${name}">${label}</label>
-        <input type="number" step="any" id="f-${name}" name="${name}"
-               min="${min}" max="${max}" data-min="${min}" data-max="${max}" required />
-        <span class="help">${help}</span>
-      `;
-    }
+    // Todas las features se ingresan como input numerico libre. La validacion
+    // OOD se hace en el momento de predecir (ver detectarOOD).
+    div.innerHTML = `
+      <label for="f-${name}">${label}</label>
+      <input type="number" step="any" id="f-${name}" name="${name}"
+             min="${min}" max="${max}" required />
+      <span class="help">${help}</span>
+    `;
     grid.appendChild(div);
   });
 }
 
 /**
- * Detecta valores out-of-distribution antes de la prediccion. Solo aplica a
- * features continuas (X1-X4): si el valor cae fuera del rango [min, max]
- * observado en entrenamiento, devuelve un mensaje de warning.
- * Las features categoricas (X5..X8) ya estan restringidas via <select>,
- * por lo que no necesitan validacion extra aqui.
+ * Detecta valores fuera del dominio observado durante el entrenamiento.
+ * Devuelve una lista de mensajes legibles para mostrar como warning.
+ *
+ * Hay dos tipos de feature en el dataset:
+ *   - Continuas (X1, X2): warning si el valor cae fuera de [min, max].
+ *   - Cuasi-categoricas (X3..X8): solo toman ciertos valores discretos en
+ *     el dataset. Warning si el valor ingresado no coincide exactamente con
+ *     ninguno de los valores validos.
+ *
+ * En cualquiera de los dos casos, el modelo esta extrapolando y los dos
+ * clasificadores (LogReg vs MLP) pueden divergir en sus predicciones.
  */
 function detectarOOD() {
   const warnings = [];
   featuresInfo.feature_names.forEach((name, idx) => {
     const el = document.getElementById(`f-${name}`);
-    // Solo features continuas: tienen data-min/data-max.
-    if (!el.dataset.min) return;
+    if (!el || el.value === "") return;
     const v = Number(el.value);
-    const min = Number(el.dataset.min);
-    const max = Number(el.dataset.max);
-    if (v < min || v > max) {
-      warnings.push(
-        `${featuresInfo.feature_labels[idx]}: ${v} fuera de [${min.toFixed(2)}, ${max.toFixed(2)}]`
-      );
+    if (isNaN(v)) return;
+
+    const opciones = featuresInfo.feature_options?.[idx];
+    const label = featuresInfo.feature_labels[idx];
+
+    if (Array.isArray(opciones) && opciones.length > 0) {
+      // Feature cuasi-categorica: el valor debe coincidir con alguno de la lista.
+      // Tolerancia pequeña para diferencias de punto flotante (ej. 0.1 vs 0.1000001).
+      const TOL = 1e-6;
+      const match = opciones.some(o => Math.abs(o - v) < TOL);
+      if (!match) {
+        warnings.push(
+          `${label}: ${v} no es un valor presente en el dataset (validos: ${opciones.join(", ")})`
+        );
+      }
+    } else {
+      // Feature continua: debe estar en [min, max].
+      const min = featuresInfo.feature_min[idx];
+      const max = featuresInfo.feature_max[idx];
+      if (v < min || v > max) {
+        warnings.push(
+          `${label}: ${v} fuera de [${min.toFixed(2)}, ${max.toFixed(2)}]`
+        );
+      }
     }
   });
   return warnings;
@@ -415,26 +418,11 @@ function mostrarResultadoIndividual(pred, proba, warnings = []) {
 // "Cargar valores promedio": rellena cada campo con la media calculada del
 // dataset (guardada en features.json). Util para que el usuario tenga un
 // punto de partida razonable en lugar de inputs vacios.
-// Para los <select> categoricos elegimos el valor de la lista mas cercano
-// al promedio (no se puede meter la media cruda en un dropdown).
 document.getElementById("btn-promedio").addEventListener("click", () => {
   featuresInfo.feature_names.forEach((name, idx) => {
-    const el = document.getElementById(`f-${name}`);
-    const mean = featuresInfo.feature_mean[idx];
-    const opciones = featuresInfo.feature_options?.[idx];
-    if (Array.isArray(opciones) && opciones.length > 0) {
-      // Buscar el valor categorico mas cercano al promedio.
-      let mejor = opciones[0];
-      let mejorDiff = Math.abs(opciones[0] - mean);
-      for (const v of opciones) {
-        const d = Math.abs(v - mean);
-        if (d < mejorDiff) { mejorDiff = d; mejor = v; }
-      }
-      el.value = mejor;
-    } else {
-      el.value = mean.toFixed(4);
-    }
-    el.classList.remove("invalido");
+    const input = document.getElementById(`f-${name}`);
+    input.value = featuresInfo.feature_mean[idx].toFixed(4);
+    input.classList.remove("invalido");
   });
 });
 
